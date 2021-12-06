@@ -5,7 +5,7 @@ data:
   batch_size: 64
   dataset_dir: data/METR-LA
   test_batch_size: 64
-  val_batch_size: 64
+  val_batch_size: 4096
   graph_pkl_filename: data/sensor_graph/adj_mx.pkl
 
 model:
@@ -20,7 +20,7 @@ model:
   output_dim: 1
   rnn_units: 64
   seq_len: 12
-  use_curriculum_learning: true
+  use_curriculum_learning: false
 
 train:
   base_lr: 0.01

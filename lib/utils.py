@@ -10,7 +10,8 @@ from scipy.sparse import linalg
 
 
 class DataLoader(object):
-    def __init__(self, xs, ys, batch_size, pad_with_last_sample=True, shuffle=False):
+    def __init__(self, xs, ys, batch_size, pad_with_last_sample=True, shuffle=False,
+                 irregularity=None):
         """
 
         :param xs:
@@ -34,6 +35,39 @@ class DataLoader(object):
         self.xs = xs
         self.ys = ys
 
+        # TODO(piyush) remove
+        self.keep = None
+        if irregularity is not None:
+            print(f"USING IRREGULAR PROB {irregularity['prob']}")
+
+            if irregularity["keep_path"] is not None:
+                print(f"LOADING MASK FROM PATH {irregularity['keep_path']}")
+                import pickle
+                with open(irregularity["keep_path"], "rb") as f:
+                    self.keep = pickle.load(f)
+            else:
+                import torch
+                self.keep = torch.rand(len(self.xs), 12) > irregularity["prob"]
+                self.keep[:, 0] = True  # Never discard the first time step
+                print(f"GENERATED MASK: {self.keep.shape}, {self.keep.float().mean()}% true")
+
+            if irregularity["mode"] == "MOSTRECENT":
+                print("USING MOSTRECENT IRREGULARITY")
+                self.irreg_func = most_recent_irreg_func
+            elif irregularity["mode"] == "ZERO":
+                print("USING ZERO IRREGULARITY")
+                self.irreg_func = zero_irreg_func
+            elif irregularity["mode"] == "LINEAR":
+                print("USING LINEAR IRREGULARITY")
+                self.irreg_func = linear_irreg_func
+            else:
+                raise ValueError(f"Invalid irregularity mode: {irregularity['mode']}")
+
+            self.labelmask = irregularity["labelmask"]
+            self.scaler = irregularity["scaler"]
+            if self.labelmask:
+                print("USING LABEL MASKING")
+
     def get_iterator(self):
         self.current_ind = 0
 
@@ -43,6 +77,20 @@ class DataLoader(object):
                 end_ind = min(self.size, self.batch_size * (self.current_ind + 1))
                 x_i = self.xs[start_ind: end_ind, ...]
                 y_i = self.ys[start_ind: end_ind, ...]
+
+                # TODO(piyush) remove
+                if self.keep is not None:
+                    keep = self.keep[start_ind : end_ind, ...]
+                    x_i = self.irreg_func(x_i, keep)
+
+                    if self.labelmask:
+                        # Make a copy to avoid making permanent changes to the data loader.
+                        masked_y = np.empty_like(y_i)
+                        masked_y[:] = y_i
+
+                        masked_y[~keep] = self.scaler.transform(0)
+                        y_i = masked_y
+
                 yield (x_i, y_i)
                 self.current_ind += 1
 
@@ -186,9 +234,32 @@ def load_dataset(dataset_dir, batch_size, test_batch_size=None, **kwargs):
     for category in ['train', 'val', 'test']:
         data['x_' + category][..., 0] = scaler.transform(data['x_' + category][..., 0])
         data['y_' + category][..., 0] = scaler.transform(data['y_' + category][..., 0])
-    data['train_loader'] = DataLoader(data['x_train'], data['y_train'], batch_size, shuffle=True)
-    data['val_loader'] = DataLoader(data['x_val'], data['y_val'], test_batch_size, shuffle=False)
-    data['test_loader'] = DataLoader(data['x_test'], data['y_test'], test_batch_size, shuffle=False)
+    # TODO(piyush) remove
+    irregularity, val_irregularity = None, None
+    if "IRREGULARITY" in os.environ:
+        irregularity = {
+            "mode": os.environ.get("IRREGULARITY", None),
+            "prob": float(os.environ.get("PROB", 0.0)),
+            "keep_path": os.environ.get("KEEP_PATH", None),
+            "labelmask": "LABELMASK" in os.environ,
+            "scaler": scaler,
+        }
+        print("USING IRREGULARITY:")
+        print(irregularity)
+    if "VAL_IRREGULARITY" in os.environ:
+        val_irregularity = {
+            "mode": os.environ.get("IRREGULARITY", None),
+            "prob": float(os.environ.get("PROB", 0.0)),
+            "keep_path": None,
+            "labelmask": False,
+            "scaler": None,
+        }
+    data['train_loader'] = DataLoader(
+        data['x_train'], data['y_train'], batch_size, shuffle=True, irregularity=irregularity)
+    data['val_loader'] = DataLoader(data['x_val'], data['y_val'], test_batch_size, shuffle=False,
+                                    irregularity=val_irregularity)
+    data['test_loader'] = DataLoader(data['x_test'], data['y_test'], test_batch_size, shuffle=False,
+                                     irregularity=val_irregularity)
     data['scaler'] = scaler
 
     return data
@@ -210,3 +281,50 @@ def load_pickle(pickle_file):
         print('Unable to load data ', pickle_file, ':', e)
         raise
     return pickle_data
+
+
+def most_recent_irreg_func(x, keep):
+    # Make a copy to avoid making permanent changes to the data loader.
+    irreg_x = np.empty_like(x)
+    irreg_x[:] = x
+    for i in range(x.shape[0]):
+        for t in range(1, x.shape[1]):
+            if not keep[i, t]:
+                irreg_x[i, t, ...] = irreg_x[i, t - 1, ...]
+    return irreg_x
+
+def zero_irreg_func(x, keep, zero_val=0):
+    # Make a copy to avoid making permanent changes to the data loader.
+    irreg_x = np.empty_like(x)
+    irreg_x[:] = x
+    for i in range(x.shape[0]):
+        for t in range(1, x.shape[1]):
+            if not keep[i, t]:
+                irreg_x[i, t, ...] = zero_val
+    return irreg_x
+
+def linear_irreg_func(x, keep):
+    # Make a copy to avoid making permanent changes to the data loader.
+    irreg_x = np.empty_like(x)
+    irreg_x[:] = x
+    for i in range(x.shape[0]):
+        t = 1
+        while t < x.shape[1]:
+            if not keep[i, t]:
+                start = t
+                while t < x.shape[1] and not keep[i, t]:
+                    t += 1
+                end = t
+
+                irreg_x[i, start : end, ...] = np.array([
+                    [
+                        np.interp(
+                            x=range(start, end), xp=[start - 1, end],
+                            fp=[irreg_x[i, start - 1, j1, j2],
+                                irreg_x[i, end, j1, j2]])
+                        for j2 in range(x.shape[3])
+                    ]
+                    for j1 in range(x.shape[2])
+                ])
+            t += 1
+    return irreg_x

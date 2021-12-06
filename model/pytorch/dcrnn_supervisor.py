@@ -2,6 +2,7 @@ import os
 import time
 
 import numpy as np
+import tqdm
 import torch
 from torch.utils.tensorboard import SummaryWriter
 
@@ -40,14 +41,23 @@ class DCRNNSupervisor:
             self._model_kwargs.get('use_curriculum_learning', False))
         self.horizon = int(self._model_kwargs.get('horizon', 1))  # for the decoder
 
+        print("CURRICULUM LEARNING?", self.use_curriculum_learning) # TODO(piyush) remove
+
         # setup model
         dcrnn_model = DCRNNModel(adj_mx, self._logger, **self._model_kwargs)
         self.dcrnn_model = dcrnn_model.cuda() if torch.cuda.is_available() else dcrnn_model
         self._logger.info("Model created")
 
         self._epoch_num = self._train_kwargs.get('epoch', 0)
-        if self._epoch_num > 0:
-            self.load_model()
+        # TODO(piyush) uncomment (never load model, which could screw up experiments)
+        # if self._epoch_num > 0:
+            # self.load_model()
+        if "LOADPATH" in os.environ:
+            self._setup_graph()
+            checkpoint = torch.load(os.environ["LOADPATH"])
+            self.dcrnn_model.load_state_dict(checkpoint["model_state_dict"])
+            self._epoch_num = checkpoint["epoch"]
+            print(f"Loaded weights from {os.environ['LOADPATH']}")
 
     @staticmethod
     def _get_log_dir(kwargs):
@@ -124,7 +134,7 @@ class DCRNNSupervisor:
             y_truths = []
             y_preds = []
 
-            for _, (x, y) in enumerate(val_iterator):
+            for _, (x, y) in tqdm.tqdm(enumerate(val_iterator)):
                 x, y = self._prepare_data(x, y)
 
                 output = self.dcrnn_model(x)
@@ -170,6 +180,7 @@ class DCRNNSupervisor:
 
         batches_seen = num_batches * self._epoch_num
 
+        save_model = False # TODO(piyush) remove
         for epoch_num in range(self._epoch_num, epochs):
 
             self.dcrnn_model = self.dcrnn_model.train()
@@ -179,7 +190,7 @@ class DCRNNSupervisor:
 
             start_time = time.time()
 
-            for _, (x, y) in enumerate(train_iterator):
+            for _, (x, y) in tqdm.tqdm(enumerate(train_iterator)):
                 optimizer.zero_grad()
 
                 x, y = self._prepare_data(x, y)
@@ -210,6 +221,20 @@ class DCRNNSupervisor:
             val_loss, _ = self.evaluate(dataset='val', batches_seen=batches_seen)
 
             end_time = time.time()
+
+            # TODO(piyush) remove
+            if "SAVEDIR" in os.environ:
+                save_path = os.path.join(os.environ["SAVEDIR"], f"model_epoch{epoch_num}.pt")
+                os.makedirs(os.path.dirname(save_path), exist_ok=True)
+                torch.save({
+                    **dict(self._kwargs),
+                    "model_state_dict": self.dcrnn_model.state_dict(),
+                    "train_mae": np.mean(losses),
+                    "val_mae": val_loss,
+                    "epoch": epoch_num,
+                    "lr": lr_scheduler.get_lr()[0]
+                }, save_path)
+                print(f"SAVED MODEL TO: {save_path}")
 
             self._writer.add_scalar('training loss',
                                     np.mean(losses),

@@ -70,7 +70,7 @@ class DecoderModel(nn.Module, Seq2SeqAttrs):
             [DCGRUCell(self.rnn_units, adj_mx, self.max_diffusion_step, self.num_nodes,
                        filter_type=self.filter_type) for _ in range(self.num_rnn_layers)])
 
-    def forward(self, inputs, hidden_state=None):
+    def forward(self, inputs, hidden_state=None, dropout_prob=None):
         """
         Decoder forward pass.
 
@@ -89,6 +89,8 @@ class DecoderModel(nn.Module, Seq2SeqAttrs):
             output = next_hidden_state
 
         projected = self.projection_layer(output.view(-1, self.rnn_units))
+        if dropout_prob is not None:
+            projected = nn.functional.dropout(projected, p=dropout_prob, training=True)
         output = projected.view(-1, self.num_nodes * self.output_dim)
 
         return output, torch.stack(hidden_states)
@@ -120,7 +122,8 @@ class DCRNNModel(nn.Module, Seq2SeqAttrs):
 
         return encoder_hidden_state
 
-    def decoder(self, encoder_hidden_state, labels=None, batches_seen=None):
+    def decoder(self, encoder_hidden_state, labels=None, batches_seen=None,
+                mc_dropout_prob=False):
         """
         Decoder forward pass
         :param encoder_hidden_state: (num_layers, batch_size, self.hidden_state_size)
@@ -137,8 +140,8 @@ class DCRNNModel(nn.Module, Seq2SeqAttrs):
         outputs = []
 
         for t in range(self.decoder_model.horizon):
-            decoder_output, decoder_hidden_state = self.decoder_model(decoder_input,
-                                                                      decoder_hidden_state)
+            decoder_output, decoder_hidden_state = self.decoder_model(
+                decoder_input, decoder_hidden_state, dropout_prob=mc_dropout_prob)
             decoder_input = decoder_output
             outputs.append(decoder_output)
             if self.training and self.use_curriculum_learning:
@@ -148,7 +151,7 @@ class DCRNNModel(nn.Module, Seq2SeqAttrs):
         outputs = torch.stack(outputs)
         return outputs
 
-    def forward(self, inputs, labels=None, batches_seen=None):
+    def forward(self, inputs, labels=None, batches_seen=None, mc_dropout_prob=None):
         """
         seq2seq forward pass
         :param inputs: shape (seq_len, batch_size, num_sensor * input_dim)
@@ -158,7 +161,8 @@ class DCRNNModel(nn.Module, Seq2SeqAttrs):
         """
         encoder_hidden_state = self.encoder(inputs)
         self._logger.debug("Encoder complete, starting decoder")
-        outputs = self.decoder(encoder_hidden_state, labels, batches_seen=batches_seen)
+        outputs = self.decoder(encoder_hidden_state, labels, batches_seen=batches_seen,
+                               mc_dropout_prob=mc_dropout_prob)
         self._logger.debug("Decoder complete")
         if batches_seen == 0:
             self._logger.info(
